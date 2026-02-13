@@ -327,14 +327,14 @@ if __name__ == "__main__":
 Examples:
   python this_script.py -s LH0007
   python this_script.py -s LH0007 -P SomePrefix
-  python this_script.py -s LH0007 -d /custom/annovar/path
+  python this_script.py -s LH0007 -d /custom/annovar/path -o /output -m /omim/omim.csv -p /hpo/hpo.txt -P prj01
         """
     )
     parser.add_argument("-s", "--sample_code", type=str, required=True, help="e.g. LH0007")
-    parser.add_argument("-d", "--directory", type=str, default="/home/sdata/ciindi/analysis/ANNOVAR")
-    parser.add_argument("-o", "--output_dir", type=str, default="/home/sdata/ciindi/analysis")
-    parser.add_argument("-m", "--omim", type=str, default="/home/sdata/ciindi/sbatches/dbs/OMIM_Summary_File.csv")
-    parser.add_argument("-p", "--hpo", type=str, default="/home/sdata/ciindi/sbatches/dbs/hpo_genes_to_phenotype.txt")
+    parser.add_argument("-d", "--directory", type=str, default=None)
+    parser.add_argument("-o", "--output_dir", type=str, default=None)
+    parser.add_argument("-m", "--omim", type=str, default=None)
+    parser.add_argument("-p", "--hpo", type=str, default=None)
     parser.add_argument("-P", "--project_name", type=str, default=None,
                         help="Optional prefix (leave empty if files are like LH0007A.hg38_multianno.csv)")
 
