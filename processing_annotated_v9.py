@@ -1,7 +1,6 @@
-
 #!/usr/bin/env python3
 """
-Post-annotation Excel generator – batch PED-driven processing.
+Post-annotation Excel generator - batch PED-driven processing.
 
 Reads ALL families from a PED file and processes each one.
 For each family, detects proband (A), father (B), mother (C),
@@ -21,10 +20,15 @@ Optional arguments:
 PED format (tab-separated, no header):
   FamilyID  SampleID  FatherID  MotherID  Sex  Phenotype
 
-Role assignment:
-  SampleID containing FamilyCode + A  ->  proband
-  SampleID containing FamilyCode + B  ->  father
-  SampleID containing FamilyCode + C  ->  mother
+Role assignment (two supported conventions, auto-detected per sample):
+  Legacy   : SampleID ending in A  ->  proband
+             SampleID ending in B  ->  father
+             SampleID ending in C  ->  mother
+  Explicit : SampleID ending in P  ->  proband
+             SampleID ending in F  ->  father  (also accepts D as alias)
+             SampleID ending in D  ->  father  (alias for F)
+             SampleID ending in M  ->  mother
+  Both conventions may coexist across families in the same PED file.
 
 Usage:
   python processing_annotated_v5.py \\
@@ -33,6 +37,29 @@ Usage:
       -o /data/output \\
       -m /dbs/OMIM_Summary_File.csv \\
       -p /dbs/hpo_genes_to_phenotype.txt
+
+Changes v8 -> v9 (this file):
+  - Quad / multi-child family support added in parse_ped().
+    Families with >1 proband sharing the same FamilyID are automatically
+    split into one trio per proband, each inheriting the shared parents.
+    Single-proband families are unaffected (fully backward-compatible).
+
+Changes v7 -> v8 (this file):
+  - DeNovo_Het sheet added to Excel output for duo/trio families only.
+    Filter: Inheritance == 'De Novo', GT == 'het', BA1 == False, intronic == False.
+    Singletons are unaffected (Inheritance is always 'Singleton' for them).
+
+Changes v6 -> v7 (this file):
+  - GEL panel annotation added (-g / --gel argument).
+    Adds a GEL_annotation column by matching Gene.refGene against Gene.Symbol
+    in the supplied CSV. Unmatched genes are labelled "Not_Present".
+    Column appears in output after HPO_phenotypes. Optional — script runs
+    without it (all rows labelled Not_Present).
+
+Changes v5 -> v6:
+  - Role detection extended: P/F/M/D suffixes now supported in addition to
+    the original A/B/C convention. D is treated as an alias for F (father).
+    Both conventions can coexist across families in the same PED file.
 
 Changes v4 -> v5:
   - Fixed gnomAD linkout for indels: ANNOVAR strips anchor base (Ref="-" or
@@ -178,7 +205,7 @@ DESIRED_COLUMN_ORDER = [
     "ExonicFunc.refGene", "AAChange.refGene",
     "cytoBand", "genomicSuperDups",
     # Script-generated analysis columns
-    "OMIM", "HPO_phenotypes", "Inheritance", "LOF", "intronic", "BA1", "variant",
+    "OMIM", "HPO_phenotypes", "GEL_annotation", "Inheritance", "LOF", "intronic", "BA1", "variant",
     # External linkouts
     "GNOMAD_linkout", "UCSC_linkout", "Decipher_linkout",
     # Top-tier pathogenicity scores
@@ -284,14 +311,30 @@ DESIRED_COLUMN_ORDER = [
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 def get_base_id(sample_id: str) -> str:
     """
-    Extract base sample ID up to and including the A/B/C role letter.
-    LH0001A_S4  ->  LH0001A
-    LH0001B_S5  ->  LH0001B
+    Split SampleID on the last underscore and return (family_part, role_letter).
+
+    The PED SampleID format is always:  {family_id}_{ROLE}
+    where ROLE is a single letter as the last underscore-delimited token.
+
+    Supported role letters:
+      P  - proband       F / D  - father       M  - mother
+      A  - proband (legacy)     B - father (legacy)   C - mother (legacy)
+
+    Examples:
+      CINDI013_EPI013SB_P  ->  family=CINDI013_EPI013SB,  role=P
+      CINDI013_EPI013SB_F  ->  family=CINDI013_EPI013SB,  role=F
+      CINDI013_EPI013SB_M  ->  family=CINDI013_EPI013SB,  role=M
+      LH0001A              ->  family=LH0001,             role=A  (legacy, no underscore)
     """
-    m = re.match(r"^(.*?[ABC])(?:[_\-].*)?$", str(sample_id), re.IGNORECASE)
-    return m.group(1) if m else str(sample_id)
+    s = str(sample_id)
+    if "_" in s:
+        family_part, role_letter = s.rsplit("_", 1)
+        return family_part, role_letter.upper()
+    # Legacy format with no trailing underscore: role letter is the last character
+    return s[:-1], s[-1].upper()
 
 
 def family_type_label(n: int) -> str:
@@ -319,7 +362,9 @@ def parse_ped(ped_path: str) -> dict:
 
     Returns:
         {
-          "LH0001": {"proband": "LH0001A", "father": "LH0001B", "mother": "LH0001C"},
+          "LH0001": {"proband": "LH0001A", "father": "LH0001B", "mother": "LH0001C"},  # A/B/C convention
+          "FAM02":  {"proband": "FAM02P",  "father": "FAM02F",  "mother": "FAM02M"},   # P/F/M convention
+          "FAM03":  {"proband": "FAM03P",  "father": "FAM03D",  "mother": "FAM03M"},   # D as father alias
           "LH0002": {"proband": "LH0002A"},
           ...
         }
@@ -338,37 +383,63 @@ def parse_ped(ped_path: str) -> dict:
     # Drop founder/missing rows (SampleID == 0 or empty)
     ped = ped[~ped["SampleID"].isin(["0", "nan", ""])].copy()
 
-    families = {}
-    role_map  = {"A": "proband", "B": "father", "C": "mother"}
+    # Legacy convention:   A=proband, B=father, C=mother
+    # Explicit convention: P=proband, F=father, M=mother
+    # D is an alias for father (equivalent to B/F)
+    role_map = {
+        "A": "proband", "B": "father", "C": "mother",   # legacy A/B/C
+        "P": "proband", "F": "father", "M": "mother",   # explicit P/F/M
+        "D": "father",                                   # D alias for father
+    }
 
+    # Use _probands list to accumulate all probands per family before exploding.
+    # This handles quad/multi-child families where >1 proband shares a family ID.
+    raw_families = {}
     for _, row in ped.iterrows():
         fid  = str(row["FamilyID"]).strip()
         sid  = str(row["SampleID"]).strip()
-        base = get_base_id(sid)
-        letter = base[-1].upper()
-        role   = role_map.get(letter)
+        family_part, letter = get_base_id(sid)
+        role = role_map.get(letter)
 
         if role is None:
-            print(f"  Warning: SampleID '{sid}' (family {fid}) does not end in A/B/C — skipped.",
+            print(f"  Warning: SampleID '{sid}' (family {fid}) — last token "
+                  f"'{letter}' is not a recognised role letter (P/F/M/D or A/B/C) — skipped.",
                   file=sys.stderr)
             continue
 
-        families.setdefault(fid, {})[role] = base
+        if role == "proband":
+            # Collect into a list — there may be >1 proband (quad families)
+            raw_families.setdefault(fid, {}).setdefault("_probands", []).append(sid)
+        else:
+            raw_families.setdefault(fid, {})[role] = sid
 
-    # Validate: every family needs a proband
-    valid = {}
-    for fid, members in families.items():
-        if "proband" not in members:
-            print(f"  Warning: Family '{fid}' has no proband (sample ending in A) — skipped.",
+    # Explode multi-proband families into one entry per proband, each sharing
+    # the same parents. Single-proband families keep their family ID as key.
+    families = {}
+    for fid, members in raw_families.items():
+        probands = members.pop("_probands", [])
+        parents  = dict(members)  # father / mother (if present)
+
+        if not probands:
+            print(f"  Warning: Family '{fid}' has no proband — skipped.",
                   file=sys.stderr)
             continue
-        valid[fid] = members
 
-    if not valid:
+        if len(probands) == 1:
+            # Standard singleton/duo/trio — backward-compatible
+            families[fid] = {"proband": probands[0], **parents}
+        else:
+            # Quad / multi-child: split into one trio per proband
+            print(f"  [INFO] Family '{fid}': {len(probands)} probands detected "
+                  f"— splitting into {len(probands)} separate trios.")
+            for p_sid in probands:
+                families[p_sid] = {"proband": p_sid, **parents}
+
+    if not families:
         print("ERROR: No valid families found in PED file.", file=sys.stderr)
         sys.exit(1)
 
-    return valid
+    return families
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -395,6 +466,37 @@ def get_hpo(hpo_path: str) -> dict:
         )
     except Exception as e:
         print(f"Warning: Could not load HPO file: {e}", file=sys.stderr)
+        return {}
+
+
+def get_gel_panel(gel_path: str) -> dict:
+    """
+    Load GEL panel annotation file and return a gene → annotation lookup dict.
+
+    Expected columns: Gene.Symbol, GEL_annotation
+    Gene symbols are upper-cased for case-insensitive matching.
+
+    Returns:
+        {"AARS": "Green_202", "ABAT": "Green_202", ...}
+        Empty dict if file is not provided or cannot be loaded.
+    """
+    if not gel_path:
+        return {}
+    try:
+        gel = pd.read_csv(gel_path)
+        # Accept common column name variants
+        col_map = {c.strip().lower(): c for c in gel.columns}
+        sym_col = col_map.get("gene.symbol") or col_map.get("gene_symbol") or col_map.get("genesymbol")
+        ann_col = col_map.get("gel_annotation") or col_map.get("gel annotation")
+        if sym_col is None or ann_col is None:
+            print(f"  Warning: GEL panel file must have 'Gene.Symbol' and "
+                  f"'GEL_annotation' columns — found: {list(gel.columns)}",
+                  file=sys.stderr)
+            return {}
+        gel[sym_col] = gel[sym_col].astype(str).str.upper()
+        return dict(zip(gel[sym_col], gel[ann_col]))
+    except Exception as e:
+        print(f"  Warning: Could not load GEL panel file: {e}", file=sys.stderr)
         return {}
 
 
@@ -559,7 +661,7 @@ def make_decipher_link(row: pd.Series) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Load and prepare one sample's multianno CSV
 # ─────────────────────────────────────────────────────────────────────────────
-def prepare_data(annovar_dir: str, base_id: str, omim: pd.DataFrame) -> pd.DataFrame:
+def prepare_data(annovar_dir: str, base_id: str, omim: pd.DataFrame, gel: dict = None) -> pd.DataFrame:
     files = find_multianno_files(annovar_dir, base_id)
     if not files:
         print(f"  ERROR: No multianno file found for '{base_id}'", file=sys.stderr)
@@ -603,6 +705,12 @@ def prepare_data(annovar_dir: str, base_id: str, omim: pd.DataFrame) -> pd.DataF
         )
     else:
         df["OMIM"] = "#N/A"
+
+    # GEL panel annotation
+    if gel:
+        df["GEL_annotation"] = df["Gene.refGene"].map(gel).fillna("Not_Present")
+    else:
+        df["GEL_annotation"] = "Not_Present"
 
     # ExonicFunc fill
     if "ExonicFunc.refGene" in df.columns:
@@ -680,6 +788,14 @@ def analyze_and_write(
 
     sheets["Raw_Data"] = proband_df.copy()
 
+    # DeNovo_Het: only meaningful for duo/trio families where Inheritance is
+    # assigned. Singletons always have Inheritance='Singleton' so this sheet
+    # is intentionally omitted for them (mirrors post_annotation.py main_trio logic).
+    if family_type in ("duo", "trio"):
+        sheets["DeNovo_Het"] = proband_df.query(
+            "Inheritance == 'De Novo' and GT == 'het' and BA1 == False and intronic == False"
+        ).copy()
+
     sheets["rare_Hom"] = proband_df.query(
         "GT == 'hom' and BA1 == False and intronic == False"
     ).copy()
@@ -721,6 +837,7 @@ def process_family(
     output_dir: str,
     omim: pd.DataFrame,
     hpo: dict,
+    gel: dict = None,
 ) -> bool:
     """Returns True on success, False if proband data is unavailable."""
     ftype      = family_type_label(len(members))
@@ -732,9 +849,9 @@ def process_family(
 
     # Load proband
     print(f"  Loading proband ({proband_id}):")
-    proband_df = prepare_data(annovar_dir, proband_id, omim)
+    proband_df = prepare_data(annovar_dir, proband_id, omim, gel)
     if proband_df.empty:
-        print(f"  SKIPPING family {family_id} – proband data unavailable.", file=sys.stderr)
+        print(f"  SKIPPING family {family_id} - proband data unavailable.", file=sys.stderr)
         return False
 
     # HPO annotation
@@ -752,11 +869,11 @@ def process_family(
 
         if "father" in members:
             print(f"  Loading father  ({members['father']}):")
-            father_df = prepare_data(annovar_dir, members["father"], omim)
+            father_df = prepare_data(annovar_dir, members["father"], omim, gel)
 
         if "mother" in members:
             print(f"  Loading mother  ({members['mother']}):")
-            mother_df = prepare_data(annovar_dir, members["mother"], omim)
+            mother_df = prepare_data(annovar_dir, members["mother"], omim, gel)
 
         in_father = (
             proband_df["variant"].isin(father_df["variant"])
@@ -838,7 +955,7 @@ def print_batch_summary_and_ask(
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
-def main(ped_path, annovar_dir, output_dir, omim_path, hpo_path, ref_path=None):
+def main(ped_path, annovar_dir, output_dir, omim_path, hpo_path, gel_path=None, ref_path=None):
     global _FASTA
 
     # Validate inputs
@@ -876,6 +993,7 @@ def main(ped_path, annovar_dir, output_dir, omim_path, hpo_path, ref_path=None):
         print(f"  OMIM db       : {omim_path}")
         print(f"  HPO db        : {hpo_path}")
         print(f"  Reference     : {ref_path or 'not provided'}")
+        print(f"  GEL panel     : {gel_path or 'not provided (GEL_annotation = Not_Present for all)'}")
         print(f"  Families      : {', '.join(sorted(families.keys()))}")
         print("=" * 80 + "\n")
 
@@ -883,6 +1001,8 @@ def main(ped_path, annovar_dir, output_dir, omim_path, hpo_path, ref_path=None):
         print("  Loading reference databases...")
         omim = get_omim(omim_path)
         hpo  = get_hpo(hpo_path)
+        gel  = get_gel_panel(gel_path)
+        print(f"  GEL panel     : {len(gel):,} genes loaded" if gel else "  GEL panel     : not loaded")
 
         # Open reference FASTA for anchor base reconstruction (indel linkouts)
         if ref_path and Path(ref_path).is_file():
@@ -912,7 +1032,7 @@ def main(ped_path, annovar_dir, output_dir, omim_path, hpo_path, ref_path=None):
         failed    = []
 
         for family_id, members in sorted(families.items()):
-            ok = process_family(family_id, members, annovar_dir, output_dir, omim, hpo)
+            ok = process_family(family_id, members, annovar_dir, output_dir, omim, hpo, gel)
             (succeeded if ok else failed).append(family_id)
 
         # Final report
@@ -939,11 +1059,11 @@ def main(ped_path, annovar_dir, output_dir, omim_path, hpo_path, ref_path=None):
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Batch post-annotation Excel generator – full PED-driven processing",
+        description="Batch post-annotation Excel generator - full PED-driven processing",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Minimal – process every family in the PED
+  # Minimal - process every family in the PED
   python processing_annotated_v5.py \\
       -f cohort.ped \\
       -d /data/annovar \\
@@ -972,16 +1092,21 @@ Examples:
     )
     parser.add_argument(
         "-m", "--omim", type=str,
-        default=None,
+        default="/path/to/dbs/OMIM_Summary_File.csv",
         help="Path to OMIM summary CSV (default: %(default)s)"
     )
     parser.add_argument(
         "-p", "--hpo", type=str,
-        default=None,
+        default="/path/to/dbs/hpo_genes_to_phenotype.txt",
         help="Path to HPO genes-to-phenotype TSV (default: %(default)s)"
     )
     parser.add_argument(
-        "-r", "--reference", type=str, default=None,
+        "-g", "--gel", type=str, default=None,
+        help="Path to GEL panel CSV with columns Gene.Symbol and GEL_annotation. "
+             "Genes not in the panel are labelled 'Not_Present'. (default: not used)"
+    )
+    parser.add_argument(
+        "-r", "--reference", type=str, default="/path/to/reference/hg38.fasta",
         help="Path to indexed reference FASTA (hg38). Enables exact variant "
              "URLs for indels in gnomAD and DECIPHER linkouts. "
              "Requires pysam and a .fai index file. (default: not used)"
@@ -995,5 +1120,6 @@ Examples:
         output_dir=args.output_dir,
         omim_path=args.omim,
         hpo_path=args.hpo,
+        gel_path=args.gel,
         ref_path=args.reference,
     )
